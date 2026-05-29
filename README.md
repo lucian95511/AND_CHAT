@@ -1,8 +1,7 @@
 <div align="center">
-╔════════════════════════════════════════════════════════════╗
-║                        AND CHAT                            ║
-║     End-to-End Encrypted · Server-Free · NAT Traversal     ║
-╚════════════════════════════════════════════════════════════╝
+                         AND CHAT                             
+      End-to-End Encrypted · Server-Free · NAT Traversal      
+
 AND Chat
 Serverless, end-to-end encrypted P2P terminal chat
 Show Image
