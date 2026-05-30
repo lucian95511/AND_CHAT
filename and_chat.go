@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -19,10 +20,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -38,8 +41,12 @@ const (
 	configFile          = "peers.conf"
 	logFile             = "chat.log"
 	groupsFile          = "groups.conf"
+	maxConcurrentDials  = 5
+	dialTimeout         = 7 * time.Second
+	keepAliveInterval   = 10 * time.Second
 )
 
+// STUNResponse represents response from STUN server
 type STUNResponse struct {
 	PublicIP   string `json:"public_ip"`
 	PublicPort int    `json:"public_port"`
@@ -47,6 +54,7 @@ type STUNResponse struct {
 	LocalPort  int    `json:"local_port"`
 }
 
+// NATInfo stores NAT traversal information
 type NATInfo struct {
 	PublicIP   string
 	PublicPort int
@@ -55,31 +63,52 @@ type NATInfo struct {
 	NATType    string
 }
 
+// STUNClient handles STUN protocol communication
 type STUNClient struct {
 	serverAddress string
 	timeout       time.Duration
+	client        *http.Client
 }
 
+// NewSTUNClient creates a new STUN client with proper configuration
 func NewSTUNClient(serverAddress string) *STUNClient {
 	return &STUNClient{
 		serverAddress: serverAddress,
 		timeout:       5 * time.Second,
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        10,
+				MaxIdleConnsPerHost: 2,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
 }
 
-func (sc *STUNClient) GetPublicAddress() (*NATInfo, error) {
-	client := &http.Client{
-		Timeout: sc.timeout,
+// GetPublicAddress queries STUN server for public address information
+func (sc *STUNClient) GetPublicAddress(ctx context.Context) (*NATInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s/stun", sc.serverAddress), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	resp, err := client.Get(fmt.Sprintf("http://%s/stun", sc.serverAddress))
+	resp, err := sc.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("STUN query failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("STUN server returned status %d", resp.StatusCode)
+	}
+
 	var stunResp STUNResponse
 	if err := json.NewDecoder(resp.Body).Decode(&stunResp); err != nil {
+		return nil, fmt.Errorf("failed to decode STUN response: %w", err)
+	}
+
+	if err := validateNATInfo(stunResp); err != nil {
 		return nil, err
 	}
 
@@ -94,78 +123,126 @@ func (sc *STUNClient) GetPublicAddress() (*NATInfo, error) {
 	return natInfo, nil
 }
 
+// validateNATInfo validates STUN response data
+func validateNATInfo(resp STUNResponse) error {
+	if net.ParseIP(resp.PublicIP) == nil {
+		return fmt.Errorf("invalid public IP: %s", resp.PublicIP)
+	}
+	if net.ParseIP(resp.LocalIP) == nil {
+		return fmt.Errorf("invalid local IP: %s", resp.LocalIP)
+	}
+	if resp.PublicPort <= 0 || resp.PublicPort > 65535 {
+		return fmt.Errorf("invalid public port: %d", resp.PublicPort)
+	}
+	if resp.LocalPort <= 0 || resp.LocalPort > 65535 {
+		return fmt.Errorf("invalid local port: %d", resp.LocalPort)
+	}
+	return nil
+}
+
+// UPnPController manages UPnP port mapping
 type UPnPController struct {
 	mu         sync.RWMutex
 	enabled    bool
 	mappedPort int
+	logger     *log.Logger
 }
 
-func NewUPnPController() *UPnPController {
+// NewUPnPController creates a new UPnP controller
+func NewUPnPController(logger *log.Logger) *UPnPController {
 	return &UPnPController{
 		enabled:    false,
 		mappedPort: 0,
+		logger:     logger,
 	}
 }
 
+// MapPort attempts to map a port via UPnP
 func (uc *UPnPController) MapPort(externalPort, internalPort int, protocol string) error {
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
 
-	fmt.Printf("[UPnP] Port Mapping: %d (%s) -> %d (Internal)\n", externalPort, protocol, internalPort)
+	if externalPort < 1 || externalPort > 65535 || internalPort < 1 || internalPort > 65535 {
+		return fmt.Errorf("invalid port range: external=%d, internal=%d", externalPort, internalPort)
+	}
+
+	uc.logger.Printf("[UPnP] Mapping %d (%s) -> %d (Internal)", externalPort, protocol, internalPort)
 	uc.enabled = true
 	uc.mappedPort = externalPort
 
 	return nil
 }
 
+// UnmapPort removes a UPnP port mapping
 func (uc *UPnPController) UnmapPort(externalPort int, protocol string) error {
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
 
-	fmt.Printf("[UPnP] Port Unmapping: %d (%s)\n", externalPort, protocol)
+	if externalPort < 1 || externalPort > 65535 {
+		return fmt.Errorf("invalid port: %d", externalPort)
+	}
+
+	uc.logger.Printf("[UPnP] Unmapping %d (%s)", externalPort, protocol)
 	uc.enabled = false
 	uc.mappedPort = 0
 
 	return nil
 }
 
+// IsEnabled checks if UPnP is currently enabled
 func (uc *UPnPController) IsEnabled() bool {
 	uc.mu.RLock()
 	defer uc.mu.RUnlock()
 	return uc.enabled
 }
 
+// HolePunchingManager manages NAT hole punching attempts
 type HolePunchingManager struct {
 	mu            sync.RWMutex
 	localIP       string
 	publicIP      string
 	localPort     int
 	publicPort    int
-	punchAttempts map[string]int
+	punchAttempts map[string]*atomic.Int32
 	maxAttempts   int
 	punchInterval time.Duration
+	logger        *log.Logger
 }
 
-func NewHolePunchingManager(localIP string, publicIP string, localPort, publicPort int) *HolePunchingManager {
+// NewHolePunchingManager creates a new hole punching manager
+func NewHolePunchingManager(localIP string, publicIP string, localPort, publicPort int, logger *log.Logger) *HolePunchingManager {
 	return &HolePunchingManager{
 		localIP:       localIP,
 		publicIP:      publicIP,
 		localPort:     localPort,
 		publicPort:    publicPort,
-		punchAttempts: make(map[string]int),
+		punchAttempts: make(map[string]*atomic.Int32),
 		maxAttempts:   5,
 		punchInterval: 200 * time.Millisecond,
+		logger:        logger,
 	}
 }
 
+// SendPunchPacket sends a hole punching packet to target
 func (hpm *HolePunchingManager) SendPunchPacket(targetIP string, targetPort int) error {
+	if !isValidIP(targetIP) {
+		return fmt.Errorf("invalid target IP: %s", targetIP)
+	}
+	if targetPort < 1 || targetPort > 65535 {
+		return fmt.Errorf("invalid target port: %d", targetPort)
+	}
+
 	hpm.mu.Lock()
-	attempts := hpm.punchAttempts[targetIP]
-	hpm.punchAttempts[targetIP] = attempts + 1
+	attempts, exists := hpm.punchAttempts[targetIP]
+	if !exists {
+		attempts = &atomic.Int32{}
+		hpm.punchAttempts[targetIP] = attempts
+	}
+	currentAttempt := int(attempts.Add(1))
 	hpm.mu.Unlock()
 
-	if attempts >= hpm.maxAttempts {
-		return fmt.Errorf("maximum punch attempts exceeded")
+	if currentAttempt > hpm.maxAttempts {
+		return fmt.Errorf("maximum punch attempts exceeded for %s", targetIP)
 	}
 
 	addr := net.UDPAddr{
@@ -175,29 +252,36 @@ func (hpm *HolePunchingManager) SendPunchPacket(targetIP string, targetPort int)
 
 	conn, err := net.DialUDP("udp", nil, &addr)
 	if err != nil {
-		return err
+		return fmt.Errorf("UDP dial failed: %w", err)
 	}
 	defer conn.Close()
 
-	_, err = conn.Write([]byte("PUNCH"))
-	if err != nil {
-		return err
+	if _, err := conn.Write([]byte("PUNCH")); err != nil {
+		return fmt.Errorf("write failed: %w", err)
 	}
 
-	fmt.Printf("[Hole Punch] Punch packet sent to %s:%d (attempt %d)\n", targetIP, targetPort, attempts+1)
+	hpm.logger.Printf("[Hole Punch] Packet sent to %s:%d (attempt %d/%d)", targetIP, targetPort, currentAttempt, hpm.maxAttempts)
 	return nil
 }
 
-func (hpm *HolePunchingManager) AttemptPunch(targetIP string, targetPort int) error {
+// AttemptPunch makes multiple hole punching attempts
+func (hpm *HolePunchingManager) AttemptPunch(ctx context.Context, targetIP string, targetPort int) error {
 	for i := 0; i < hpm.maxAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if err := hpm.SendPunchPacket(targetIP, targetPort); err != nil {
-			fmt.Printf("[Hole Punch] ⚠️ Error connecting to %s:%d: %v\n", targetIP, targetPort, err)
+			hpm.logger.Printf("[Hole Punch] Error: %v", err)
 		}
 		time.Sleep(hpm.punchInterval)
 	}
 	return nil
 }
 
+// EndpointManager manages NAT endpoint discovery and traversal
 type EndpointManager struct {
 	mu           sync.RWMutex
 	stunClient   *STUNClient
@@ -206,70 +290,86 @@ type EndpointManager struct {
 	natInfo      *NATInfo
 	lastRefresh  time.Time
 	refreshTimer *time.Timer
+	ctx          context.Context
+	cancel       context.CancelFunc
+	logger       *log.Logger
 }
 
-func NewEndpointManager(stunServer string) *EndpointManager {
+// NewEndpointManager creates a new endpoint manager
+func NewEndpointManager(stunServer string, logger *log.Logger) *EndpointManager {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &EndpointManager{
 		stunClient:  NewSTUNClient(stunServer),
-		upnpControl: NewUPnPController(),
+		upnpControl: NewUPnPController(logger),
 		natInfo:     nil,
 		lastRefresh: time.Now(),
+		ctx:         ctx,
+		cancel:      cancel,
+		logger:      logger,
 	}
 }
 
-func (em *EndpointManager) RefreshNATInfo() (*NATInfo, error) {
+// RefreshNATInfo queries for updated NAT information
+func (em *EndpointManager) RefreshNATInfo(ctx context.Context) (*NATInfo, error) {
 	em.mu.Lock()
 	defer em.mu.Unlock()
 
-	natInfo, err := em.stunClient.GetPublicAddress()
+	natInfo, err := em.stunClient.GetPublicAddress(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("STUN query failed: %v", err)
+		return nil, fmt.Errorf("STUN query failed: %w", err)
 	}
 
 	em.natInfo = natInfo
-
 	em.holePunch = NewHolePunchingManager(
 		natInfo.LocalIP,
 		natInfo.PublicIP,
 		natInfo.LocalPort,
 		natInfo.PublicPort,
+		em.logger,
 	)
 
 	em.lastRefresh = time.Now()
 
-	fmt.Printf("[NAT] Public IP: %s:%d | Local IP: %s:%d\n",
+	em.logger.Printf("[NAT] Public IP: %s:%d | Local IP: %s:%d",
 		natInfo.PublicIP, natInfo.PublicPort,
 		natInfo.LocalIP, natInfo.LocalPort)
 
 	return natInfo, nil
 }
 
+// SetupPortMapping configures UPnP port mapping
 func (em *EndpointManager) SetupPortMapping(internalPort int) error {
 	em.mu.RLock()
 	upnp := em.upnpControl
 	em.mu.RUnlock()
 
 	if err := upnp.MapPort(internalPort, internalPort, "TCP"); err != nil {
-		fmt.Printf("[UPnP] ⚠️ Port mapping failed: %v\n", err)
-		fmt.Println("[UPnP] 💡 Please configure port forwarding manually on your router")
-		return err
+		return fmt.Errorf("port mapping failed: %w", err)
 	}
 
 	return nil
 }
 
+// GetNATInfo returns current NAT information
 func (em *EndpointManager) GetNATInfo() *NATInfo {
 	em.mu.RLock()
 	defer em.mu.RUnlock()
 	return em.natInfo
 }
 
+// GetHolePunch returns hole punching manager
 func (em *EndpointManager) GetHolePunch() *HolePunchingManager {
 	em.mu.RLock()
 	defer em.mu.RUnlock()
 	return em.holePunch
 }
 
+// Close cleanup resources
+func (em *EndpointManager) Close() {
+	em.cancel()
+}
+
+// MessageType defines message categories
 type MessageType string
 
 const (
@@ -280,6 +380,7 @@ const (
 	MSG_PRIVATE MessageType = "private"
 )
 
+// Message represents a chat message
 type Message struct {
 	Type      MessageType       `json:"type"`
 	From      string            `json:"from"`
@@ -290,6 +391,7 @@ type Message struct {
 	Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
+// UserStatus defines user presence status
 type UserStatus string
 
 const (
@@ -299,6 +401,7 @@ const (
 	STATUS_OFFLINE UserStatus = "offline"
 )
 
+// UserProfile represents user information
 type UserProfile struct {
 	Username  string
 	Status    UserStatus
@@ -307,6 +410,7 @@ type UserProfile struct {
 	PublicKey string
 }
 
+// PeerInfo stores connected peer information
 type PeerInfo struct {
 	IP           string
 	Name         string
@@ -314,13 +418,14 @@ type PeerInfo struct {
 	LastActivity time.Time
 	Status       UserStatus
 	StatusMsg    string
-	MessageCount int
+	MessageCount int32
 	IsTyping     bool
 	Profile      *UserProfile
 	PublicIP     string
 	PublicPort   int
 }
 
+// SavedPeer represents a saved peer configuration
 type SavedPeer struct {
 	IP      string
 	Name    string
@@ -329,6 +434,7 @@ type SavedPeer struct {
 	Starred bool
 }
 
+// Group represents a chat group
 type Group struct {
 	ID        string
 	Name      string
@@ -338,16 +444,18 @@ type Group struct {
 	IsActive  bool
 }
 
+// PeerStats tracks peer statistics
 type PeerStats struct {
-	TotalMessages    int
-	TotalConnections int
+	TotalMessages    int64
+	TotalConnections int64
 	SessionStart     time.Time
 	BytesSent        int64
 	BytesReceived    int64
-	SuccessfulNATs   int
-	FailedNATs       int
+	SuccessfulNATs   int64
+	FailedNATs       int64
 }
 
+// PeerManager manages P2P peer connections and messaging
 type PeerManager struct {
 	mu              sync.RWMutex
 	peers           map[string]net.Conn
@@ -371,10 +479,18 @@ type PeerManager struct {
 	favorites       map[string]bool
 	endpointMgr     *EndpointManager
 	natInfo         *NATInfo
+	dialSemaphore   chan struct{}
+	ctx             context.Context
+	cancel          context.CancelFunc
 }
 
-func NewPeerManager(name string, tlsCfg *tls.Config, tlsServerCfg *tls.Config) *PeerManager {
-	logFile, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+// NewPeerManager creates a new peer manager instance
+func NewPeerManager(name string, tlsCfg *tls.Config, tlsServerCfg *tls.Config) (*PeerManager, error) {
+	logFilePath := filepath.Join(".", logFile)
+	file, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open log file: %w", err)
+	}
 
 	profile := &UserProfile{
 		Username:  name,
@@ -383,9 +499,12 @@ func NewPeerManager(name string, tlsCfg *tls.Config, tlsServerCfg *tls.Config) *
 		LastSeen:  time.Now(),
 	}
 
-	endpointMgr := NewEndpointManager("stun.l.google.com:19302")
+	ctx, cancel := context.WithCancel(context.Background())
+	logger := log.New(os.Stdout, "[P2P] ", log.LstdFlags|log.Lshortfile)
 
-	return &PeerManager{
+	endpointMgr := NewEndpointManager("stun.l.google.com:19302", logger)
+
+	pm := &PeerManager{
 		peers:           make(map[string]net.Conn),
 		peerInfo:        make(map[string]*PeerInfo),
 		name:            name,
@@ -395,27 +514,36 @@ func NewPeerManager(name string, tlsCfg *tls.Config, tlsServerCfg *tls.Config) *
 		shutdown:        make(chan struct{}),
 		messageLog:      make([]Message, 0, 1000),
 		maxLogSize:      1000,
-		logger:          log.New(os.Stdout, "[P2P] ", log.LstdFlags),
+		logger:          logger,
 		savedPeers:      make(map[string]*SavedPeer),
-		logFile:         logFile,
+		logFile:         file,
 		groups:          make(map[string]*Group),
 		commandHistory:  make([]string, 0, 100),
 		maxHistorySize:  100,
 		blockedUsers:    make(map[string]bool),
 		favorites:       make(map[string]bool),
 		endpointMgr:     endpointMgr,
+		dialSemaphore:   make(chan struct{}, maxConcurrentDials),
+		ctx:             ctx,
+		cancel:          cancel,
 		stats: PeerStats{
 			SessionStart: time.Now(),
 		},
 	}
+
+	return pm, nil
 }
 
+// InitializeNAT initializes NAT traversal mechanisms
 func (pm *PeerManager) InitializeNAT() {
 	fmt.Println("[NAT] 🌍 Initializing NAT Traversal...")
 
-	natInfo, err := pm.endpointMgr.RefreshNATInfo()
+	ctx, cancel := context.WithTimeout(pm.ctx, 10*time.Second)
+	defer cancel()
+
+	natInfo, err := pm.endpointMgr.RefreshNATInfo(ctx)
 	if err != nil {
-		fmt.Printf("[NAT] ⚠️ STUN query failed: %v\n", err)
+		pm.logger.Printf("[NAT] STUN query failed: %v", err)
 		fmt.Println("[NAT] 💡 Switching to manual connection mode...")
 		return
 	}
@@ -431,6 +559,7 @@ func (pm *PeerManager) InitializeNAT() {
 	pm.PrintNATInfo()
 }
 
+// PrintNATInfo displays NAT information
 func (pm *PeerManager) PrintNATInfo() {
 	if pm.natInfo == nil {
 		fmt.Println("\n[NAT] ❌ NAT information unavailable\n")
@@ -452,12 +581,16 @@ func (pm *PeerManager) PrintNATInfo() {
 	fmt.Println()
 }
 
+// GenerateMessageID creates a unique message identifier
 func GenerateMessageID() string {
 	b := make([]byte, 8)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
 	return hex.EncodeToString(b)
 }
 
+// FormatMessage formats a message for display
 func FormatMessage(msg Message) string {
 	switch msg.Type {
 	case MSG_SYSTEM:
@@ -471,6 +604,7 @@ func FormatMessage(msg Message) string {
 	}
 }
 
+// AddCommandToHistory adds a command to history
 func (pm *PeerManager) AddCommandToHistory(cmd string) {
 	pm.commandHistory = append(pm.commandHistory, cmd)
 	if len(pm.commandHistory) > pm.maxHistorySize {
@@ -478,46 +612,73 @@ func (pm *PeerManager) AddCommandToHistory(cmd string) {
 	}
 }
 
+// BlockUser blocks communication from a user
 func (pm *PeerManager) BlockUser(ip string) {
+	if !isValidIP(ip) {
+		fmt.Printf("\n[System] ❌ Invalid IP: %s\n\n", ip)
+		return
+	}
+
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
 	pm.blockedUsers[ip] = true
+	pm.mu.Unlock()
 	fmt.Printf("\n[System] ✓ %s blocked.\n\n", ip)
 }
 
+// UnblockUser removes a user from blocklist
 func (pm *PeerManager) UnblockUser(ip string) {
+	if !isValidIP(ip) {
+		fmt.Printf("\n[System] ❌ Invalid IP: %s\n\n", ip)
+		return
+	}
+
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
 	delete(pm.blockedUsers, ip)
+	pm.mu.Unlock()
 	fmt.Printf("\n[System] ✓ %s unblocked.\n\n", ip)
 }
 
+// IsUserBlocked checks if a user is blocked
 func (pm *PeerManager) IsUserBlocked(ip string) bool {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return pm.blockedUsers[ip]
 }
 
+// AddFavorite adds a peer to favorites
 func (pm *PeerManager) AddFavorite(ip string) {
+	if !isValidIP(ip) {
+		fmt.Printf("\n[System] ❌ Invalid IP: %s\n\n", ip)
+		return
+	}
+
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
 	pm.favorites[ip] = true
+	pm.mu.Unlock()
 	fmt.Printf("\n[System] ⭐ %s added to favorites.\n\n", ip)
 }
 
+// RemoveFavorite removes a peer from favorites
 func (pm *PeerManager) RemoveFavorite(ip string) {
+	if !isValidIP(ip) {
+		fmt.Printf("\n[System] ❌ Invalid IP: %s\n\n", ip)
+		return
+	}
+
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
 	delete(pm.favorites, ip)
+	pm.mu.Unlock()
 	fmt.Printf("\n[System] ✓ %s removed from favorites.\n\n", ip)
 }
 
+// IsFavorite checks if a peer is in favorites
 func (pm *PeerManager) IsFavorite(ip string) bool {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return pm.favorites[ip]
 }
 
+// SetUserStatus updates user status
 func (pm *PeerManager) SetUserStatus(status UserStatus, msg string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -526,6 +687,7 @@ func (pm *PeerManager) SetUserStatus(status UserStatus, msg string) {
 	pm.profile.LastSeen = time.Now()
 }
 
+// CreateGroup creates a new chat group
 func (pm *PeerManager) CreateGroup(name string) string {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -545,7 +707,13 @@ func (pm *PeerManager) CreateGroup(name string) string {
 	return id
 }
 
+// AddMemberToGroup adds a peer to a group
 func (pm *PeerManager) AddMemberToGroup(groupID, peerIP string) {
+	if !isValidIP(peerIP) {
+		fmt.Printf("\n[System] ❌ Invalid IP: %s\n\n", peerIP)
+		return
+	}
+
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -557,6 +725,7 @@ func (pm *PeerManager) AddMemberToGroup(groupID, peerIP string) {
 	}
 }
 
+// PrintAdvancedHelp displays help information
 func (pm *PeerManager) PrintAdvancedHelp() {
 	fmt.Println("\n╔══════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║          🔒 AND CHAT - ADVANCED COMMAND GUIDE 🔒               ║")
@@ -613,20 +782,22 @@ func (pm *PeerManager) PrintAdvancedHelp() {
 	fmt.Println("═══════════════════════════════════════════════════════════════════\n")
 }
 
+// PrintDetailedStatistics displays statistics
 func (pm *PeerManager) PrintDetailedStatistics() {
 	pm.mu.RLock()
 	activePeers := len(pm.peers)
-	totalMessages := pm.stats.TotalMessages
-	bytesSent := pm.stats.BytesSent
-	bytesReceived := pm.stats.BytesReceived
-	successNATs := pm.stats.SuccessfulNATs
-	failedNATs := pm.stats.FailedNATs
 	pm.mu.RUnlock()
 
 	sessionDuration := time.Since(pm.stats.SessionStart)
 	avgMsgSize := int64(0)
+	totalMessages := atomic.LoadInt64(&pm.stats.TotalMessages)
+	bytesSent := atomic.LoadInt64(&pm.stats.BytesSent)
+	bytesReceived := atomic.LoadInt64(&pm.stats.BytesReceived)
+	successNATs := atomic.LoadInt64(&pm.stats.SuccessfulNATs)
+	failedNATs := atomic.LoadInt64(&pm.stats.FailedNATs)
+
 	if totalMessages > 0 {
-		avgMsgSize = (bytesSent + bytesReceived) / int64(totalMessages)
+		avgMsgSize = (bytesSent + bytesReceived) / totalMessages
 	}
 
 	fmt.Println("\n╔══════════════════════════════════════════════════════════════╗")
@@ -636,7 +807,7 @@ func (pm *PeerManager) PrintDetailedStatistics() {
 	fmt.Printf("Session Duration:      %v\n", sessionDuration.Round(time.Second))
 	fmt.Printf("Total Messages:        %d\n", totalMessages)
 	fmt.Printf("Active Connections:    %d\n", activePeers)
-	fmt.Printf("Total Connections:     %d\n", pm.stats.TotalConnections)
+	fmt.Printf("Total Connections:     %d\n", atomic.LoadInt64(&pm.stats.TotalConnections))
 	fmt.Printf("Successful NAT Passes:  %d\n", successNATs)
 	fmt.Printf("Failed NAT Passes:     %d\n", failedNATs)
 	fmt.Printf("Data Sent:             %.2f MB\n", float64(bytesSent)/1024/1024)
@@ -645,6 +816,7 @@ func (pm *PeerManager) PrintDetailedStatistics() {
 	fmt.Println("══════════════════════════════════════════════════════════════════\n")
 }
 
+// PrintUserProfile displays user profile information
 func (pm *PeerManager) PrintUserProfile(ip string) {
 	pm.mu.RLock()
 	info, exists := pm.peerInfo[ip]
@@ -666,10 +838,11 @@ func (pm *PeerManager) PrintUserProfile(ip string) {
 	fmt.Printf("Status Message:      %s\n", info.StatusMsg)
 	fmt.Printf("Connection Time:     %s\n", info.ConnectedAt.Format("02.01.2006 15:04:05"))
 	fmt.Printf("Last Activity:       %s\n", info.LastActivity.Format("02.01.2006 15:04:05"))
-	fmt.Printf("Message Count:       %d\n", info.MessageCount)
+	fmt.Printf("Message Count:       %d\n", atomic.LoadInt32(&info.MessageCount))
 	fmt.Println("════════════════════════════════════════\n")
 }
 
+// PrintBlockedUsers displays blocked users list
 func (pm *PeerManager) PrintBlockedUsers() {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -689,6 +862,7 @@ func (pm *PeerManager) PrintBlockedUsers() {
 	fmt.Println("===================================\n")
 }
 
+// PrintGroups displays groups list
 func (pm *PeerManager) PrintGroups() {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -714,13 +888,19 @@ func main() {
 	tlsClientConfig, tlsServerConfig, fingerprint, err := generateTLSConfig()
 	if err != nil {
 		fmt.Printf("[CRITICAL ERROR] TLS Certificate generation failed: %v\n", err)
-		return
+		os.Exit(1)
 	}
 
 	reader := bufio.NewReader(os.Stdin)
 	username := getUserInput(reader)
 
-	pm := NewPeerManager(username, tlsClientConfig, tlsServerConfig)
+	pm, err := NewPeerManager(username, tlsClientConfig, tlsServerConfig)
+	if err != nil {
+		fmt.Printf("[CRITICAL ERROR] Failed to create peer manager: %v\n", err)
+		os.Exit(1)
+	}
+	defer pm.Close()
+
 	pm.certFingerprint = fingerprint
 	pm.loadSavedPeers()
 
@@ -737,6 +917,7 @@ func main() {
 	commandLoop(reader, pm)
 }
 
+// commandLoop handles user input
 func commandLoop(reader *bufio.Reader, pm *PeerManager) {
 	for {
 		fmt.Print("\033[36m" + pm.name + " > \033[0m")
@@ -761,6 +942,7 @@ func commandLoop(reader *bufio.Reader, pm *PeerManager) {
 	}
 }
 
+// handlePrivateMessage handles private messages
 func handlePrivateMessage(input string, pm *PeerManager) {
 	parts := strings.SplitN(input, " ", 2)
 	if len(parts) < 2 {
@@ -771,10 +953,15 @@ func handlePrivateMessage(input string, pm *PeerManager) {
 	targetName := strings.TrimPrefix(parts[0], "@")
 	content := parts[1]
 
+	if len(content) > maxMessageLength {
+		fmt.Printf("\n[System] ❌ Message too long (max %d characters).\n\n", maxMessageLength)
+		return
+	}
+
 	pm.mu.RLock()
 	var targetIP string
 	for ip, info := range pm.peerInfo {
-		if strings.ToLower(info.Name) == strings.ToLower(targetName) {
+		if strings.EqualFold(info.Name, targetName) {
 			targetIP = ip
 			break
 		}
@@ -818,6 +1005,7 @@ func handlePrivateMessage(input string, pm *PeerManager) {
 	pm.logMessage(msg)
 }
 
+// handleCommand processes user commands
 func handleCommand(input string, pm *PeerManager, reader *bufio.Reader) {
 	parts := strings.Fields(input)
 	if len(parts) == 0 {
@@ -844,10 +1032,14 @@ func handleCommand(input string, pm *PeerManager, reader *bufio.Reader) {
 			return
 		}
 		targetIP := parts[1]
+		if !isValidIP(targetIP) {
+			fmt.Printf("\n[System] ❌ Invalid IP: %s\n\n", targetIP)
+			return
+		}
 		fmt.Printf("\n[System] 🔨 Initiating hole punching to %s...\n\n", targetIP)
 		holePunch := pm.endpointMgr.GetHolePunch()
 		if holePunch != nil {
-			go holePunch.AttemptPunch(targetIP, 8888)
+			go holePunch.AttemptPunch(pm.ctx, targetIP, 8888)
 		}
 
 	case "/connect":
@@ -891,6 +1083,10 @@ func handleCommand(input string, pm *PeerManager, reader *bufio.Reader) {
 			return
 		}
 		ip := parts[1]
+		if !isValidIP(ip) {
+			fmt.Printf("\n[System] ❌ Invalid IP: %s\n\n", ip)
+			return
+		}
 		if pm.IsFavorite(ip) {
 			pm.RemoveFavorite(ip)
 		} else {
@@ -999,7 +1195,7 @@ func handleCommand(input string, pm *PeerManager, reader *bufio.Reader) {
 	case "/remove-all":
 		fmt.Print("[Warning] Delete all saved peers? (y/n): ")
 		confirm, _ := reader.ReadString('\n')
-		if strings.ToLower(strings.TrimSpace(confirm)) == "y" {
+		if strings.EqualFold(strings.TrimSpace(confirm), "y") {
 			pm.deleteAllSavedPeers()
 		}
 
@@ -1023,6 +1219,7 @@ func handleCommand(input string, pm *PeerManager, reader *bufio.Reader) {
 	}
 }
 
+// resolvePeerName resolves a peer name to IP address
 func resolvePeerName(pm *PeerManager, target string) string {
 	if isValidIP(target) {
 		return target
@@ -1030,16 +1227,22 @@ func resolvePeerName(pm *PeerManager, target string) string {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	for name, peer := range pm.savedPeers {
-		if strings.ToLower(name) == strings.ToLower(target) {
+		if strings.EqualFold(name, target) {
 			return peer.IP
 		}
 	}
 	return ""
 }
 
+// savePeer saves a peer configuration
 func (pm *PeerManager) savePeer(ip, name string) {
 	if !isValidIP(ip) {
 		fmt.Printf("\n[System] ❌ Invalid IP: %s\n\n", ip)
+		return
+	}
+
+	if name == "" {
+		fmt.Println("\n[System] ❌ Name cannot be empty.\n")
 		return
 	}
 
@@ -1055,12 +1258,13 @@ func (pm *PeerManager) savePeer(ip, name string) {
 	fmt.Printf("\n[System] ✓ '%s' -> %s saved.\n\n", name, ip)
 }
 
+// deleteSavedPeer removes a saved peer
 func (pm *PeerManager) deleteSavedPeer(target string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	for key, peer := range pm.savedPeers {
-		if key == strings.ToLower(target) || peer.IP == target {
+		if strings.EqualFold(key, target) || peer.IP == target {
 			delete(pm.savedPeers, key)
 			fmt.Printf("\n[System] ✓ '%s' deleted.\n\n", key)
 			pm.writeSavedPeers()
@@ -1071,18 +1275,25 @@ func (pm *PeerManager) deleteSavedPeer(target string) {
 	fmt.Printf("\n[System] ❌ '%s' not found.\n\n", target)
 }
 
+// deleteAllSavedPeers removes all saved peers
 func (pm *PeerManager) deleteAllSavedPeers() {
 	pm.mu.Lock()
 	pm.savedPeers = make(map[string]*SavedPeer)
 	pm.mu.Unlock()
 
-	os.Remove(configFile)
+	if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
+		fmt.Printf("\n[System] ⚠️ Warning: %v\n\n", err)
+	}
 	fmt.Println("\n[System] ✓ All saved peers deleted.\n")
 }
 
+// loadSavedPeers loads saved peers from configuration file
 func (pm *PeerManager) loadSavedPeers() {
 	data, err := os.ReadFile(configFile)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			pm.logger.Printf("Warning: failed to read config file: %v", err)
+		}
 		return
 	}
 
@@ -1097,6 +1308,10 @@ func (pm *PeerManager) loadSavedPeers() {
 		if len(parts) == 2 {
 			name := strings.TrimSpace(parts[0])
 			ip := strings.TrimSpace(parts[1])
+			if !isValidIP(ip) {
+				pm.logger.Printf("Warning: skipping invalid IP in config: %s", ip)
+				continue
+			}
 			pm.savedPeers[strings.ToLower(name)] = &SavedPeer{
 				IP:   ip,
 				Name: name,
@@ -1105,6 +1320,7 @@ func (pm *PeerManager) loadSavedPeers() {
 	}
 }
 
+// writeSavedPeers persists saved peers to configuration file
 func (pm *PeerManager) writeSavedPeers() {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -1116,9 +1332,12 @@ func (pm *PeerManager) writeSavedPeers() {
 
 	sort.Strings(lines)
 	content := strings.Join(lines, "\n")
-	os.WriteFile(configFile, []byte(content), 0644)
+	if err := os.WriteFile(configFile, []byte(content), 0644); err != nil {
+		pm.logger.Printf("Error writing config file: %v", err)
+	}
 }
 
+// printSavedPeers displays saved peers
 func (pm *PeerManager) printSavedPeers() {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -1154,6 +1373,7 @@ func (pm *PeerManager) printSavedPeers() {
 	fmt.Println("===========================\n")
 }
 
+// printPeerList displays connected peers
 func (pm *PeerManager) printPeerList() {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -1170,13 +1390,15 @@ func (pm *PeerManager) printPeerList() {
 			if _, exists := pm.peers[ip]; exists {
 				connTime := info.ConnectedAt.Format("15:04")
 				lastActivity := info.LastActivity.Format("15:04")
-				fmt.Printf("%-15s %-20s %-15s %-12s %-8d\n", ip, info.Name, connTime, lastActivity, info.MessageCount)
+				msgCount := atomic.LoadInt32(&info.MessageCount)
+				fmt.Printf("%-15s %-20s %-15s %-12s %-8d\n", ip, info.Name, connTime, lastActivity, msgCount)
 			}
 		}
 	}
 	fmt.Println("============================\n")
 }
 
+// printMessageLog displays message history
 func (pm *PeerManager) printMessageLog() {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -1196,6 +1418,7 @@ func (pm *PeerManager) printMessageLog() {
 	fmt.Println("==================================\n")
 }
 
+// printLocalIP displays network information
 func (pm *PeerManager) printLocalIP() {
 	fmt.Println("\n=== 🖥️ NETWORK INFORMATION ===")
 
@@ -1230,6 +1453,7 @@ func (pm *PeerManager) printLocalIP() {
 	fmt.Println("===========================\n")
 }
 
+// printSecurityInfo displays security information
 func (pm *PeerManager) printSecurityInfo() {
 	fmt.Println("\n=== 🔒 SECURITY INFORMATION ===")
 	fmt.Println("Encryption Standard: TLS 1.3")
@@ -1246,6 +1470,7 @@ func (pm *PeerManager) printSecurityInfo() {
 	fmt.Println("=============================\n")
 }
 
+// connectToPeer establishes a connection to a peer
 func (pm *PeerManager) connectToPeer(ip string) {
 	if pm.IsUserBlocked(ip) {
 		fmt.Printf("\n[System] ❌ %s is blocked.\n\n", ip)
@@ -1263,7 +1488,15 @@ func (pm *PeerManager) connectToPeer(ip string) {
 	}
 	pm.mu.RUnlock()
 
-	dialer := &net.Dialer{Timeout: 7 * time.Second}
+	// Acquire semaphore slot
+	select {
+	case pm.dialSemaphore <- struct{}{}:
+		defer func() { <-pm.dialSemaphore }()
+	case <-pm.ctx.Done():
+		return
+	}
+
+	dialer := &net.Dialer{Timeout: dialTimeout}
 	tlsConn, err := tls.DialWithDialer(dialer, "tcp", target, pm.tlsConfig)
 	if err != nil {
 		fmt.Printf("\n[System] ❌ Cannot connect to %s.\n", ip)
@@ -1271,10 +1504,10 @@ func (pm *PeerManager) connectToPeer(ip string) {
 
 		holePunch := pm.endpointMgr.GetHolePunch()
 		if holePunch != nil {
-			go holePunch.AttemptPunch(ip, 8888)
+			go holePunch.AttemptPunch(pm.ctx, ip, 8888)
 		}
 
-		pm.stats.FailedNATs++
+		atomic.AddInt64(&pm.stats.FailedNATs, 1)
 		pm.refreshPrompt()
 		return
 	}
@@ -1289,11 +1522,12 @@ func (pm *PeerManager) connectToPeer(ip string) {
 	_, _ = tlsConn.Write([]byte(pm.name + ":CONNECT\n"))
 
 	pm.registerPeer(ip, "", tlsConn)
-	pm.stats.TotalConnections++
-	pm.stats.SuccessfulNATs++
+	atomic.AddInt64(&pm.stats.TotalConnections, 1)
+	atomic.AddInt64(&pm.stats.SuccessfulNATs, 1)
 	go pm.handleConnection(tlsConn, ip)
 }
 
+// disconnectAllPeers closes all peer connections
 func (pm *PeerManager) disconnectAllPeers() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -1309,7 +1543,13 @@ func (pm *PeerManager) disconnectAllPeers() {
 	fmt.Println("\n[System] ✓ All connections closed.\n")
 }
 
+// disconnectPeer closes a specific peer connection
 func (pm *PeerManager) disconnectPeer(ip string) {
+	if !isValidIP(ip) {
+		fmt.Printf("\n[System] ❌ Invalid IP: %s\n\n", ip)
+		return
+	}
+
 	pm.mu.Lock()
 	conn, exists := pm.peers[ip]
 	if !exists {
@@ -1328,6 +1568,7 @@ func (pm *PeerManager) disconnectPeer(ip string) {
 	fmt.Printf("\n[System] ✓ Connection to %s closed.\n\n", ip)
 }
 
+// broadcastMessage sends a message to all connected peers
 func (pm *PeerManager) broadcastMessage(text string) {
 	if len(text) > maxMessageLength {
 		fmt.Printf("\n[System] ❌ Message too long (max %d characters).\n\n", maxMessageLength)
@@ -1354,17 +1595,17 @@ func (pm *PeerManager) broadcastMessage(text string) {
 
 	for ip, conn := range peers {
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-		_, err := conn.Write([]byte(formattedMessage))
+		n, err := conn.Write([]byte(formattedMessage))
 		conn.SetWriteDeadline(time.Time{})
 
 		if err == nil {
-			pm.stats.BytesSent += int64(len(formattedMessage))
+			atomic.AddInt64(&pm.stats.BytesSent, int64(n))
 		} else {
 			failedPeers = append(failedPeers, ip)
 		}
 	}
 
-	pm.stats.TotalMessages++
+	atomic.AddInt64(&pm.stats.TotalMessages, 1)
 	pm.logMessage(msg)
 	pm.writeToLogFile(fmt.Sprintf("%s [%s]: %s", time.Now().Format("15:04:05"), pm.name, text))
 
@@ -1380,6 +1621,7 @@ func (pm *PeerManager) broadcastMessage(text string) {
 	}
 }
 
+// logMessage adds message to log
 func (pm *PeerManager) logMessage(msg Message) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -1391,12 +1633,14 @@ func (pm *PeerManager) logMessage(msg Message) {
 	}
 }
 
+// writeToLogFile writes message to log file
 func (pm *PeerManager) writeToLogFile(msg string) {
 	if pm.logFile != nil {
 		fmt.Fprintln(pm.logFile, msg)
 	}
 }
 
+// startTLSListener starts the TLS server listener
 func (pm *PeerManager) startTLSListener() {
 	listener, err := tls.Listen("tcp", chatPort, pm.tlsServerConfig)
 	if err != nil {
@@ -1416,6 +1660,7 @@ func (pm *PeerManager) startTLSListener() {
 
 		conn, err := listener.Accept()
 		if err != nil {
+			pm.logger.Printf("Accept error: %v", err)
 			continue
 		}
 
@@ -1424,6 +1669,7 @@ func (pm *PeerManager) startTLSListener() {
 	}
 }
 
+// handleConnection processes messages from a peer
 func (pm *PeerManager) handleConnection(conn net.Conn, ip string) {
 	if pm.IsUserBlocked(ip) {
 		conn.Close()
@@ -1469,7 +1715,7 @@ func (pm *PeerManager) handleConnection(conn net.Conn, ip string) {
 			continue
 		}
 
-		pm.stats.BytesReceived += int64(len(message))
+		atomic.AddInt64(&pm.stats.BytesReceived, int64(len(message)))
 
 		if message == ":PING" {
 			conn.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -1507,11 +1753,11 @@ func (pm *PeerManager) handleConnection(conn net.Conn, ip string) {
 
 		pm.mu.Lock()
 		if info, exists := pm.peerInfo[ip]; exists {
-			info.MessageCount++
+			atomic.AddInt32(&info.MessageCount, 1)
 		}
 		pm.mu.Unlock()
 
-		pm.stats.TotalMessages++
+		atomic.AddInt64(&pm.stats.TotalMessages, 1)
 
 		fmt.Printf("\n%s\n\n", message)
 		pm.writeToLogFile(fmt.Sprintf("%s [%s]: %s", time.Now().Format("15:04:05"), ip, message))
@@ -1519,8 +1765,9 @@ func (pm *PeerManager) handleConnection(conn net.Conn, ip string) {
 	}
 }
 
+// startKeepAlive sends periodic ping messages
 func (pm *PeerManager) startKeepAlive(conn net.Conn, ip string, done chan struct{}) {
-	ticker := time.NewTicker(pingInterval)
+	ticker := time.NewTicker(keepAliveInterval)
 	defer ticker.Stop()
 
 	for {
@@ -1547,10 +1794,14 @@ func (pm *PeerManager) startKeepAlive(conn net.Conn, ip string, done chan struct
 
 		case <-pm.shutdown:
 			return
+
+		case <-pm.ctx.Done():
+			return
 		}
 	}
 }
 
+// updatePeerActivity updates peer's last activity time
 func (pm *PeerManager) updatePeerActivity(ip string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -1561,6 +1812,7 @@ func (pm *PeerManager) updatePeerActivity(ip string) {
 	}
 }
 
+// registerPeer adds or updates a peer connection
 func (pm *PeerManager) registerPeer(ip, name string, conn net.Conn) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -1593,6 +1845,7 @@ func (pm *PeerManager) registerPeer(ip, name string, conn net.Conn) {
 	}
 }
 
+// handleSystemSignals handles OS signals for graceful shutdown
 func (pm *PeerManager) handleSystemSignals() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -1605,6 +1858,7 @@ func (pm *PeerManager) handleSystemSignals() {
 	os.Exit(0)
 }
 
+// closeAllConnections gracefully closes all connections
 func (pm *PeerManager) closeAllConnections() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -1619,6 +1873,18 @@ func (pm *PeerManager) closeAllConnections() {
 	}
 }
 
+// Close cleanup resources
+func (pm *PeerManager) Close() {
+	pm.cancel()
+	if pm.endpointMgr != nil {
+		pm.endpointMgr.Close()
+	}
+	if pm.logFile != nil {
+		pm.logFile.Close()
+	}
+}
+
+// printWelcomeScreen displays welcome information
 func (pm *PeerManager) printWelcomeScreen() {
 	fmt.Println("\n--------------------------------------------------")
 	fmt.Printf("🚀 Secure Layer Active! Connected as \033[32m%s\033[0m.\n", pm.name)
@@ -1632,6 +1898,7 @@ func (pm *PeerManager) printWelcomeScreen() {
 	fmt.Println("--------------------------------------------------\n")
 }
 
+// getUserInput gets and validates username from user
 func getUserInput(reader *bufio.Reader) string {
 	for {
 		fmt.Print("👉 Enter your chat name (max 32 characters): ")
@@ -1657,21 +1924,25 @@ func getUserInput(reader *bufio.Reader) string {
 	}
 }
 
+// isValidUsername validates username format
 func isValidUsername(username string) bool {
 	pattern := `^[a-zA-Z0-9_\-]{1,32}$`
 	matched, _ := regexp.MatchString(pattern, username)
 	return matched
 }
 
+// isValidIP validates IP address format
 func isValidIP(ip string) bool {
 	return net.ParseIP(ip) != nil
 }
 
+// verifyTLSState checks if TLS 1.3 is being used
 func verifyTLSState(conn *tls.Conn) bool {
 	state := conn.ConnectionState()
 	return state.Version >= tls.VersionTLS13
 }
 
+// sanitizeInput removes dangerous characters from input
 func sanitizeInput(in string) string {
 	r := strings.NewReplacer(
 		"\x1b", "",
@@ -1682,10 +1953,11 @@ func sanitizeInput(in string) string {
 	return r.Replace(in)
 }
 
+// generateTLSConfig generates TLS configuration with self-signed certificates
 func generateTLSConfig() (*tls.Config, *tls.Config, string, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", fmt.Errorf("failed to generate private key: %w", err)
 	}
 
 	template := x509.Certificate{
@@ -1703,19 +1975,19 @@ func generateTLSConfig() (*tls.Config, *tls.Config, string, error) {
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", fmt.Errorf("failed to create certificate: %w", err)
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", fmt.Errorf("failed to marshal private key: %w", err)
 	}
 	privPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
 
 	cert, err := tls.X509KeyPair(certPEM, privPEM)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", fmt.Errorf("failed to parse key pair: %w", err)
 	}
 
 	fingerprint := calculateFingerprint(derBytes)
@@ -1736,22 +2008,26 @@ func generateTLSConfig() (*tls.Config, *tls.Config, string, error) {
 	return tlsClientConfig, tlsServerConfig, fingerprint, nil
 }
 
+// calculateFingerprint generates certificate fingerprint
 func calculateFingerprint(certDER []byte) string {
 	hash := sha256.Sum256(certDER)
 	return hex.EncodeToString(hash[:16])
 }
 
+// clearScreen clears terminal screen
 func clearScreen() {
 	fmt.Print("\033[H\033[2J")
 }
 
+// printBanner prints application banner
 func printBanner() {
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Println("║                            AND CHAT                        ║")
+	fmt.Println("║                          AND CHAT                          ║")
 	fmt.Println("║     End-to-End Encrypted - Server-Free - NAT Traversal     ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 }
 
+// refreshPrompt redisplays the command prompt
 func (pm *PeerManager) refreshPrompt() {
 	fmt.Printf("\033[36m" + pm.name + " > \033[0m")
 }
