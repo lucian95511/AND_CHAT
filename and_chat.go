@@ -1,18 +1,5 @@
 package main
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  AND CHAT v2  —  Sunucusuz, Uçtan Uca Şifreli P2P Sohbet
-//  Yenilikler:
-//    • NAT traversal: TCP hole punching + STUN ile gerçek IP keşfi
-//    • Otomatik yeniden bağlanma (exponential backoff)
-//    • Çevrimdışı mesaj kuyruğu (peer geri dönünce teslim)
-//    • Peer exchange (birbirinin tanıdığı kişileri paylaşma)
-//    • Tam JSON protokolü (sürüm müzakeresi)
-//    • Bant genişliği hız sınırlayıcı
-//    • Çoklu mesaj türü: normal, özel, sistem, dosya meta, durum
-//    • /relay komutu: güvenilir bir arkadaş üzerinden NAT geçişi
-// ─────────────────────────────────────────────────────────────────────────────
-
 import (
 	"bufio"
 	"context"
@@ -44,10 +31,6 @@ import (
 	"time"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Sabitler
-// ─────────────────────────────────────────────────────────────────────────────
-
 const (
 	chatPort             = ":8888"
 	rendezvousPort       = ":9999"
@@ -74,10 +57,6 @@ const (
 	rateLimit            = 20 // saniyede max mesaj
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Protokol türleri
-// ─────────────────────────────────────────────────────────────────────────────
-
 type MessageType string
 
 const (
@@ -103,11 +82,6 @@ const (
 	STATUS_OFFLINE UserStatus = "offline"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Veri yapıları
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Wire protokolündeki tüm mesajlar bu yapıyla taşınır.
 type Packet struct {
 	Version   string      `json:"v"`
 	Type      MessageType `json:"type"`
@@ -120,30 +94,27 @@ type Packet struct {
 	PublicIP  string      `json:"pub_ip,omitempty"`
 }
 
-// PeerAddr, paylaşılabilir peer adresi.
 type PeerAddr struct {
 	IP   string `json:"ip"`
 	Port string `json:"port"`
 	Name string `json:"name"`
 }
 
-// ConnState, bir bağlantının tam durumunu tutar.
 type ConnState struct {
 	conn         net.Conn
 	name         string
 	ip           string
-	publicIP     string // STUN ile öğrenilen
+	publicIP     string 
 	connectedAt  time.Time
 	lastActivity time.Time
 	status       UserStatus
 	statusMsg    string
 	messageCount int32
 	inviteCode   string
-	version      string // karşı tarafın protokol sürümü
+	version      string 
 	rateLimiter  *RateLimiter
 }
 
-// SavedPeer, diske kaydedilen peer.
 type SavedPeer struct {
 	IP         string    `json:"ip"`
 	Name       string    `json:"name"`
@@ -154,14 +125,12 @@ type SavedPeer struct {
 	Starred    bool      `json:"starred"`
 }
 
-// OfflineMessage, çevrimdışı peer için kuyruklanan mesaj.
 type OfflineMessage struct {
 	Packet   Packet
 	QueuedAt time.Time
 	Attempts int
 }
 
-// ReconnectJob, otomatik yeniden bağlanma görevi.
 type ReconnectJob struct {
 	ip      string
 	name    string
@@ -169,16 +138,12 @@ type ReconnectJob struct {
 	nextAt  time.Time
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Hız sınırlayıcı (token bucket)
-// ─────────────────────────────────────────────────────────────────────────────
-
 type RateLimiter struct {
 	mu       sync.Mutex
 	tokens   int
 	max      int
 	lastFill time.Time
-	rate     int // token/saniye
+	rate     int
 }
 
 func NewRateLimiter(rate int) *RateLimiter {
@@ -202,12 +167,6 @@ func (r *RateLimiter) Allow() bool {
 	return false
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STUN — gerçek genel IP keşfi
-// ─────────────────────────────────────────────────────────────────────────────
-
-// discoverPublicIP basit STUN binding isteği gönderir ve genel IP:port döner.
-// RFC 5389 uyumlu: sadece Binding Request / XOR-MAPPED-ADDRESS okur.
 func discoverPublicIP() (string, string, error) {
 	servers := []string{stunServer1, stunServer2}
 	for _, srv := range servers {
@@ -227,18 +186,15 @@ func stunQuery(server string) (string, string, error) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	// STUN Binding Request: 20 byte header
 	req := make([]byte, 20)
-	req[0] = 0x00 // Binding Request
+	req[0] = 0x00
 	req[1] = 0x01
-	req[2] = 0x00 // length = 0 (attributes yok)
+	req[2] = 0x00 
 	req[3] = 0x00
-	// Magic Cookie
 	req[4] = 0x21
 	req[5] = 0x12
 	req[6] = 0xa4
 	req[7] = 0x42
-	// Transaction ID (rastgele 12 byte)
 	txID := make([]byte, 12)
 	rand.Read(txID)
 	copy(req[8:], txID)
@@ -253,7 +209,6 @@ func stunQuery(server string) (string, string, error) {
 		return "", "", fmt.Errorf("STUN yanıtı alınamadı")
 	}
 
-	// Attribute'ları parse et
 	pos := 20
 	for pos+4 <= n {
 		attrType := binary.BigEndian.Uint16(resp[pos : pos+2])
@@ -264,16 +219,14 @@ func stunQuery(server string) (string, string, error) {
 		}
 		data := resp[pos : pos+attrLen]
 
-		// XOR-MAPPED-ADDRESS (0x0020) veya MAPPED-ADDRESS (0x0001)
 		if (attrType == 0x0020 || attrType == 0x0001) && attrLen >= 8 {
 			family := data[1]
-			if family == 0x01 { // IPv4
+			if family == 0x01 { 
 				rawPort := binary.BigEndian.Uint16(data[2:4])
 				rawIP := binary.BigEndian.Uint32(data[4:8])
 				var port uint16
 				var ipInt uint32
 				if attrType == 0x0020 {
-					// XOR ile şifreli
 					magic := uint32(0x2112a442)
 					port = rawPort ^ 0x2112
 					ipInt = rawIP ^ magic
@@ -287,7 +240,6 @@ func stunQuery(server string) (string, string, error) {
 				return ipStr, fmt.Sprintf("%d", port), nil
 			}
 		}
-		// padding: 4'e yuvarla
 		pos += attrLen
 		if attrLen%4 != 0 {
 			pos += 4 - attrLen%4
@@ -296,13 +248,6 @@ func stunQuery(server string) (string, string, error) {
 	return "", "", fmt.Errorf("STUN yanıtında adres bulunamadı")
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TCP Hole Punching
-// ─────────────────────────────────────────────────────────────────────────────
-
-// holePunch, iki tarafın da aynı anda bağlantı açmaya çalışmasını sağlar.
-// Rendezvous sunucusu koordinasyonu için kullanılır.
-// Her iki taraf da birbirinin IP:portuna aynı anda SYN gönderir.
 func holePunch(ctx context.Context, remoteAddr string, localPort int) (net.Conn, error) {
 	laddr := &net.TCPAddr{Port: localPort}
 	raddr, err := net.ResolveTCPAddr("tcp", remoteAddr)
@@ -314,7 +259,6 @@ func holePunch(ctx context.Context, remoteAddr string, localPort int) (net.Conn,
 	errCh := make(chan error, 1)
 	connCh := make(chan net.Conn, 1)
 
-	// Dinleyici (karşı taraf bize bağlanabilir)
 	ln, err := net.ListenTCP("tcp", laddr)
 	if err == nil {
 		go func() {
@@ -329,7 +273,6 @@ func holePunch(ctx context.Context, remoteAddr string, localPort int) (net.Conn,
 		}()
 	}
 
-	// Biz bağlanalım (SYN gönder)
 	go func() {
 		d := net.Dialer{LocalAddr: laddr, Timeout: 10 * time.Second}
 		c, e := d.DialContext(ctx, "tcp", raddr.String())
@@ -350,14 +293,10 @@ func holePunch(ctx context.Context, remoteAddr string, localPort int) (net.Conn,
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Davet kodu kayıt defteri
-// ─────────────────────────────────────────────────────────────────────────────
-
 type InviteEntry struct {
 	Code          string
 	OwnerIP       string
-	OwnerPublicIP string // STUN ile öğrenilen
+	OwnerPublicIP string 
 	OwnerPort     string
 	OwnerName     string
 	CreatedAt     time.Time
@@ -415,12 +354,8 @@ func generateInviteCode() string {
 	return string(b)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Rendezvous dinleyici  (port 9999)
-// ─────────────────────────────────────────────────────────────────────────────
-
 type RendezvousRequest struct {
-	Action string `json:"action"` // "resolve", "punch_notify"
+	Action string `json:"action"`
 	Code   string `json:"code"`
 	IP     string `json:"ip,omitempty"`
 	Port   string `json:"port,omitempty"`
@@ -432,7 +367,7 @@ type RendezvousResponse struct {
 	PublicIP  string `json:"pub_ip,omitempty"`
 	Port      string `json:"port,omitempty"`
 	Name      string `json:"name,omitempty"`
-	NeedPunch bool   `json:"need_punch,omitempty"` // NAT traversal gerekli mi
+	NeedPunch bool   `json:"need_punch,omitempty"`
 	Message   string `json:"message,omitempty"`
 }
 
@@ -465,7 +400,6 @@ func handleRendezvous(conn net.Conn, registry *InviteRegistry, logger *log.Logge
 	switch req.Action {
 	case "resolve":
 		if entry, ok := registry.Resolve(req.Code); ok {
-			// Genel IP varsa paylaş (NAT traversal için)
 			pubIP := entry.OwnerPublicIP
 			needPunch := pubIP != "" && pubIP != entry.OwnerIP
 			resp = RendezvousResponse{
@@ -490,7 +424,6 @@ func handleRendezvous(conn net.Conn, registry *InviteRegistry, logger *log.Logge
 func resolveInviteCode(registry *InviteRegistry, code, host string) (*RendezvousResponse, error) {
 	code = strings.ToUpper(strings.TrimSpace(code))
 
-	// Önce yerel kayıt defteri
 	if entry, ok := registry.Resolve(code); ok {
 		return &RendezvousResponse{
 			OK:       true,
@@ -525,50 +458,39 @@ func resolveInviteCode(registry *InviteRegistry, code, host string) (*Rendezvous
 	return &resp, nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PeerManager — merkezi koordinatör
-// ─────────────────────────────────────────────────────────────────────────────
-
 type PeerManager struct {
 	mu sync.RWMutex
 
-	// Bağlantılar
-	conns      map[string]*ConnState // ip → durum
+	conns      map[string]*ConnState 
 	name       string
 	localIP    string
-	publicIP   string // STUN ile öğrenilen
+	publicIP   string
 	publicPort string
 
-	// TLS
 	tlsClient *tls.Config
 	tlsServer *tls.Config
 	certFP    string
 
-	// Davet
+
 	inviteReg *InviteRegistry
 
-	// Kalıcı kayıtlar
-	savedPeers   map[string]*SavedPeer // küçük harf isim → peer
+	savedPeers   map[string]*SavedPeer
 	blockedUsers map[string]bool
 	favorites    map[string]bool
 
-	// Mesaj geçmişi & çevrimdışı kuyruk
 	messageLog   []Packet
 	maxLogSize   int
-	offlineQueue map[string][]OfflineMessage // ip → mesajlar
+	offlineQueue map[string][]OfflineMessage 
 
-	// Yeniden bağlanma
 	reconnectJobs map[string]*ReconnectJob
 	reconnectCh   chan ReconnectJob
 
-	// İstatistikler
 	totalMessages    int64
 	totalConnections int64
 	bytesSent        int64
 	bytesReceived    int64
 	sessionStart     time.Time
 
-	// Altyapı
 	logFile        *os.File
 	logger         *log.Logger
 	commandHistory []string
@@ -578,7 +500,6 @@ type PeerManager struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 
-	// Profil
 	statusMsg string
 	status    UserStatus
 }
@@ -621,9 +542,6 @@ func NewPeerManager(name string, tlsClient, tlsServer *tls.Config) (*PeerManager
 	return pm, nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STUN ile genel IP keşfi
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (pm *PeerManager) discoverPublicAddress() {
 	fmt.Println("[System] 🌐 Genel IP adresi belirleniyor (STUN)...")
@@ -644,9 +562,6 @@ func (pm *PeerManager) discoverPublicAddress() {
 	fmt.Printf("[System] ✓ NAT      : %s\n\n", natStr)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Davet sistemi
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (pm *PeerManager) GenerateInvite() {
 	port := strings.TrimPrefix(chatPort, ":")
@@ -709,7 +624,6 @@ func (pm *PeerManager) JoinViaInvite(input string) {
 		go pm.connectToPeer(targetIP, resp.Name, true)
 	}
 
-	// Otomatik kaydet
 	pm.mu.Lock()
 	key := strings.ToLower(resp.Name)
 	if _, exists := pm.savedPeers[key]; !exists {
@@ -726,9 +640,6 @@ func (pm *PeerManager) JoinViaInvite(input string) {
 	pm.inviteReg.Expire(code)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TLS bağlantı katmanı
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (pm *PeerManager) connectToPeer(ip, hint string, saveOnSuccess bool) {
 	if pm.isBlocked(ip) {
@@ -755,7 +666,6 @@ func (pm *PeerManager) connectToPeer(ip, hint string, saveOnSuccess bool) {
 	tlsConn, err := tls.DialWithDialer(d, "tcp", target, pm.tlsClient)
 	if err != nil {
 		fmt.Printf("\n[System] ❌ %s adresine bağlanılamadı: %v\n\n", ip, err)
-		// Yeniden bağlanma planla (eğer kayıtlı peer ise)
 		if saveOnSuccess {
 			pm.scheduleReconnect(ip, hint)
 		}
@@ -770,7 +680,6 @@ func (pm *PeerManager) connectToPeer(ip, hint string, saveOnSuccess bool) {
 
 	atomic.AddInt64(&pm.totalConnections, 1)
 	pm.registerConn(ip, hint, tlsConn)
-	// El sıkışma paketi gönder
 	pm.sendPacket(tlsConn, Packet{
 		Type:     MSG_HANDSHAKE,
 		From:     pm.name,
@@ -781,7 +690,6 @@ func (pm *PeerManager) connectToPeer(ip, hint string, saveOnSuccess bool) {
 }
 
 func (pm *PeerManager) connectWithHolePunch(remotePublicIP, name string) {
-	// Basit hole punch: karşı tarafın portuna doğrudan TCP dene
 	port := strings.TrimPrefix(chatPort, ":")
 	target := remotePublicIP + ":" + port
 
@@ -790,13 +698,11 @@ func (pm *PeerManager) connectWithHolePunch(remotePublicIP, name string) {
 
 	conn, err := holePunch(ctx, target, 0)
 	if err != nil {
-		// Hole punch başarısız olursa normal bağlantı dene
 		fmt.Printf("[System] ⚠️  Hole punch başarısız (%v), doğrudan bağlantı deneniyor...\n", err)
 		pm.connectToPeer(remotePublicIP, name, true)
 		return
 	}
 
-	// TLS wrap
 	tlsConn := tls.Client(conn, pm.tlsClient)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
@@ -844,10 +750,6 @@ func (pm *PeerManager) startTLSListener() {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Bağlantı işleyici
-// ─────────────────────────────────────────────────────────────────────────────
-
 func (pm *PeerManager) handleConn(conn net.Conn, ip string) {
 	done := make(chan struct{})
 	go pm.keepAlive(conn, ip, done)
@@ -862,7 +764,6 @@ func (pm *PeerManager) handleConn(conn net.Conn, ip string) {
 		name := ip
 		if cs != nil {
 			name = cs.name
-			// Kayıtlı peer ise yeniden bağlanmayı planla
 			pm.mu.RLock()
 			_, saved := pm.savedPeers[strings.ToLower(cs.name)]
 			pm.mu.RUnlock()
@@ -896,7 +797,6 @@ func (pm *PeerManager) handleConn(conn net.Conn, ip string) {
 			pm.registerConn(ip, pkt.From, conn)
 			pm.conns[ip].publicIP = pkt.PublicIP
 			pm.conns[ip].version = pkt.Version
-			// Karşılıklı el sıkışma
 			pm.sendPacket(conn, Packet{
 				Type:     MSG_HANDSHAKE,
 				From:     pm.name,
@@ -905,9 +805,7 @@ func (pm *PeerManager) handleConn(conn net.Conn, ip string) {
 			})
 			fmt.Printf("\n\033[32m[System] 🔐 %s ile şifreli tünel kuruldu!\033[0m\n", pkt.From)
 			pm.refreshPrompt()
-			// Çevrimdışı kuyruktaki mesajları ilet
 			go pm.flushOfflineQueue(ip)
-			// Peer exchange: tanıdıklarımızı paylaş
 			go pm.sendPeerList(conn)
 			continue
 		case MSG_PEER_LIST:
@@ -930,12 +828,11 @@ func (pm *PeerManager) handleConn(conn net.Conn, ip string) {
 			continue
 		}
 
-		// Hız sınırlama
 		pm.mu.RLock()
 		cs := pm.conns[ip]
 		pm.mu.RUnlock()
 		if cs != nil && !cs.rateLimiter.Allow() {
-			continue // çok hızlı mesaj gönderiliyor, say
+			continue
 		}
 
 		pm.touchConn(ip)
@@ -962,10 +859,6 @@ func (pm *PeerManager) displayMessage(pkt Packet) {
 	pm.writeLog(fmt.Sprintf("[%s] %s: %s", ts, pkt.From, pkt.Content))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Peer exchange
-// ─────────────────────────────────────────────────────────────────────────────
-
 func (pm *PeerManager) sendPeerList(conn net.Conn) {
 	pm.mu.RLock()
 	var peers []PeerAddr
@@ -987,7 +880,6 @@ func (pm *PeerManager) sendPeerList(conn net.Conn) {
 }
 
 func (pm *PeerManager) handlePeerList(pkt Packet) {
-	// Tanımadığımız peerları kayıtlara ekle (bağlantı açmıyoruz, sadece kaydediyoruz)
 	for _, pa := range pkt.Peers {
 		if pa.IP == pm.localIP || pa.IP == pm.publicIP {
 			continue
@@ -1005,10 +897,6 @@ func (pm *PeerManager) handlePeerList(pkt Packet) {
 		pm.mu.Unlock()
 	}
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Relay (NAT geçişi için arkadaş üzerinden yönlendirme)
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (pm *PeerManager) SendViaRelay(relayName, targetName, content string) {
 	pm.mu.RLock()
@@ -1036,7 +924,6 @@ func (pm *PeerManager) SendViaRelay(relayName, targetName, content string) {
 }
 
 func (pm *PeerManager) handleRelayRequest(pkt Packet, fromConn net.Conn) {
-	// Bize yönlendirilen mesajı hedef peer'a ilet
 	pm.mu.RLock()
 	var targetConn net.Conn
 	for _, cs := range pm.conns {
@@ -1048,7 +935,6 @@ func (pm *PeerManager) handleRelayRequest(pkt Packet, fromConn net.Conn) {
 	pm.mu.RUnlock()
 
 	if targetConn == nil {
-		// Hedef bulunamadı, göndericiye bildir
 		pm.sendPacket(fromConn, Packet{
 			Type:    MSG_SYSTEM,
 			From:    "[System]",
@@ -1057,7 +943,6 @@ func (pm *PeerManager) handleRelayRequest(pkt Packet, fromConn net.Conn) {
 		return
 	}
 
-	// Yönlendir
 	pm.sendPacket(targetConn, Packet{
 		Type:    MSG_RELAY_FWD,
 		From:    pkt.From,
@@ -1066,16 +951,12 @@ func (pm *PeerManager) handleRelayRequest(pkt Packet, fromConn net.Conn) {
 	})
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Çevrimdışı kuyruk
-// ─────────────────────────────────────────────────────────────────────────────
-
 func (pm *PeerManager) queueOffline(ip string, pkt Packet) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	q := pm.offlineQueue[ip]
 	if len(q) >= offlineQueueMax {
-		q = q[1:] // en eskiyi at
+		q = q[1:]
 	}
 	pm.offlineQueue[ip] = append(q, OfflineMessage{Packet: pkt, QueuedAt: time.Now()})
 }
@@ -1096,10 +977,6 @@ func (pm *PeerManager) flushOfflineQueue(ip string) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Otomatik yeniden bağlanma
-// ─────────────────────────────────────────────────────────────────────────────
-
 func (pm *PeerManager) scheduleReconnect(ip, name string) {
 	pm.mu.Lock()
 	job, exists := pm.reconnectJobs[ip]
@@ -1115,7 +992,6 @@ func (pm *PeerManager) scheduleReconnect(ip, name string) {
 		return
 	}
 
-	// Exponential backoff: 2s, 4s, 8s, ... max 5dk
 	delay := reconnectBaseDelay * time.Duration(1<<uint(bits.Len(uint(job.attempt-1))))
 	if delay > reconnectMaxDelay {
 		delay = reconnectMaxDelay
@@ -1151,9 +1027,6 @@ func (pm *PeerManager) CancelReconnect(ip string) {
 	fmt.Printf("[System] ✓ %s için yeniden bağlanma iptal edildi.\n\n", ip)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Yardımcı fonksiyonlar
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (pm *PeerManager) sendPacket(conn net.Conn, pkt Packet) error {
 	if pkt.ID == "" {
@@ -1260,10 +1133,6 @@ func (pm *PeerManager) Close() {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Mesajlaşma
-// ─────────────────────────────────────────────────────────────────────────────
-
 func (pm *PeerManager) BroadcastMessage(text string) {
 	if len(text) > maxMessageLength {
 		fmt.Printf("\n[System] ❌ Mesaj çok uzun (max %d karakter).\n\n", maxMessageLength)
@@ -1297,7 +1166,6 @@ func (pm *PeerManager) BroadcastMessage(text string) {
 	atomic.AddInt64(&pm.totalMessages, 1)
 	pm.logPacket(pkt)
 
-	// Başarısız bağlantıları temizle
 	if len(failed) > 0 {
 		pm.mu.Lock()
 		for _, ip := range failed {
@@ -1326,7 +1194,6 @@ func (pm *PeerManager) SendPrivate(targetName, content string) {
 	pm.mu.RUnlock()
 
 	if target == nil {
-		// Çevrimdışı — kuyruğa ekle
 		pm.mu.RLock()
 		var targetIP string
 		for _, sp := range pm.savedPeers {
@@ -1355,10 +1222,6 @@ func (pm *PeerManager) SendPrivate(targetName, content string) {
 	fmt.Printf("\n✓ \033[35m[ÖZEL → %s]: %s\033[0m\n\n", targetName, content)
 	pm.logPacket(pkt)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Bağlantı yönetimi komutları
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (pm *PeerManager) DisconnectPeer(ip string) {
 	pm.mu.Lock()
@@ -1400,10 +1263,6 @@ func (pm *PeerManager) closeAll() {
 	pm.mu.Unlock()
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Peer kayıt / yükleme
-// ─────────────────────────────────────────────────────────────────────────────
-
 func (pm *PeerManager) savePeer(ip, name string) {
 	if !isValidIP(ip) {
 		fmt.Printf("\n[System] ❌ Geçersiz IP: %s\n\n", ip)
@@ -1440,7 +1299,6 @@ func (pm *PeerManager) loadSavedPeers() {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// Format: name=ip  (eski) veya JSON (yeni)
 		if strings.HasPrefix(line, "{") {
 			var sp SavedPeer
 			if err := json.Unmarshal([]byte(line), &sp); err == nil && isValidIP(sp.IP) {
@@ -1469,10 +1327,6 @@ func (pm *PeerManager) writeSavedPeers() {
 	sort.Strings(lines)
 	_ = os.WriteFile(configFile, []byte(strings.Join(lines, "\n")), 0600)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Ekrana yazdırma yardımcıları
-// ─────────────────────────────────────────────────────────────────────────────
 
 func (pm *PeerManager) PrintPeers() {
 	pm.mu.RLock()
@@ -1649,10 +1503,6 @@ func (pm *PeerManager) printWelcome() {
 	fmt.Println("──────────────────────────────────────────────────────────")
 	fmt.Println()
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Komut döngüsü
-// ─────────────────────────────────────────────────────────────────────────────
 
 func commandLoop(reader *bufio.Reader, pm *PeerManager) {
 	for {
@@ -1886,9 +1736,6 @@ func handleCommand(input string, pm *PeerManager, reader *bufio.Reader) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Yardımcı fonksiyonlar
-// ─────────────────────────────────────────────────────────────────────────────
 
 func detectLocalIP() string {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
@@ -1929,10 +1776,6 @@ func isValidUsername(u string) bool {
 func sanitize(in string) string {
 	return strings.NewReplacer("\x1b", "", "\033", "", "\r", "", "\x00", "").Replace(in)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TLS sertifika üretimi
-// ─────────────────────────────────────────────────────────────────────────────
 
 func generateTLS() (*tls.Config, *tls.Config, string, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -1982,10 +1825,6 @@ func generateTLS() (*tls.Config, *tls.Config, string, error) {
 	return client, server, fp, nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Sinyal işleyici
-// ─────────────────────────────────────────────────────────────────────────────
-
 func handleSignals(pm *PeerManager) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
@@ -1996,9 +1835,6 @@ func handleSignals(pm *PeerManager) {
 	os.Exit(0)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// main
-// ─────────────────────────────────────────────────────────────────────────────
 
 func main() {
 	fmt.Print("\033[H\033[2J")
@@ -2048,10 +1884,8 @@ func main() {
 	pm.loadSavedPeers()
 	fmt.Printf("[System] ✓ %d kayıtlı peer yüklendi.\n", len(pm.savedPeers))
 
-	// STUN ile genel IP öğren
 	pm.discoverPublicAddress()
 
-	// Dinleyicileri başlat
 	go pm.startTLSListener()
 	go startRendezvousListener(pm.inviteReg, pm.logger)
 	go handleSignals(pm)
